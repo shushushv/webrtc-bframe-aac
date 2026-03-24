@@ -1,0 +1,156 @@
+<!DOCTYPE html>
+<!--
+  SPDX-FileCopyrightText: 2026 shushushv
+  SPDX-License-Identifier: MIT
+-->
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>WebRTC B-frame + AAC Player</title>
+  <link rel="icon" href="data:,">
+  <script src="video-player.js"></script>
+  <script src="audio-player.js"></script>
+  <style>
+    body { font-family: sans-serif; padding: 20px; }
+    button { font-size: 16px; padding: 8px 20px; cursor: pointer; }
+    #status { margin-top: 12px; color: #555; }
+  </style>
+</head>
+<body>
+  <h2>WebRTC H.264 B-frame + AAC Player</h2>
+  <button id="startBtn" onclick="startPlayback()">Subscribe</button>
+  <div id="status">Click Subscribe to start.</div>
+</body>
+<script>
+  // ── Video player (WebCodecs + frame buffer for B-frame reordering) ─────────
+  const videoPlayer = new WebCodecsVideoPlayer({ frameRate: 25, bufferSize: 5 });
+  videoPlayer.init();
+
+  // ── Audio player (WebCodecs AudioDecoder via the "Opus trick") ────────────
+  let audioPlayer = null;
+
+  const AUDIO_SAMPLE_RATE = 48000;
+
+  // ── Entry point ───────────────────────────────────────────────────────────
+  async function startPlayback() {
+    document.getElementById('startBtn').disabled = true;
+    setStatus('Connecting…');
+
+    try {
+      audioPlayer = new WebCodecsAudioPlayer();
+      await audioPlayer.init(AUDIO_SAMPLE_RATE, 2);
+    } catch (e) {
+      console.warn('[audio] init failed:', e);
+      audioPlayer = null;
+    }
+
+    const pc = buildPeerConnection();
+
+    pc.addTransceiver('video', { direction: 'recvonly' });
+    if (audioPlayer) {
+      pc.addTransceiver('audio', { direction: 'recvonly' });
+    }
+
+    setupReceivers(pc);
+
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    await waitForIceGathering(pc);
+    dbg(1, '[signalling] offer created, ICE gathering complete', { offer: pc.localDescription.sdp });
+
+    // "Opus trick": rewrite the outgoing SDP so the server negotiates MP4A-LATM.
+    let outgoingSDP = pc.localDescription.sdp;
+    if (audioPlayer) {
+      outgoingSDP = rewriteSDPAudioToAAC(outgoingSDP, AUDIO_SAMPLE_RATE);
+      dbg(1, '[audio] SDP rewritten for MP4A-LATM at', AUDIO_SAMPLE_RATE);
+    }
+
+    const resp = await fetch('/whep', {
+      method: 'POST',
+      body: outgoingSDP,
+      headers: { 'Content-Type': 'application/sdp' },
+    });
+
+    if (!resp.ok) {
+      setStatus('Server error: ' + resp.status);
+      return;
+    }
+
+    const answerSDP = await resp.text();
+    dbg(1, '[signalling] answer received', { answerSDP });
+    await pc.setRemoteDescription({ type: 'answer', sdp: answerSDP });
+    setStatus(`Connected — audio ${audioPlayer ? AUDIO_SAMPLE_RATE + ' Hz' : 'off'}`);
+  }
+
+  // ── RTCPeerConnection factory ─────────────────────────────────────────────
+  function buildPeerConnection() {
+    const pc = new RTCPeerConnection({ encodedInsertableStreams: true });
+
+    pc.onconnectionstatechange = () => {
+      dbg(1, '[pc] connectionState:', pc.connectionState);
+    };
+
+    return pc;
+  }
+
+  // ── EncodedInsertableStreams setup ────────────────────────────────────────
+  function setupReceivers(pc) {
+    pc.oniceconnectionstatechange = () => {
+      dbg(1, '[ice]', pc.iceConnectionState);
+      setStatus('ICE: ' + pc.iceConnectionState);
+
+      if (pc.iceConnectionState !== 'connected') return;
+
+      for (const receiver of pc.getReceivers()) {
+        if (receiver.track.kind === 'video') {
+          setupVideoReceiver(receiver);
+        } else if (receiver.track.kind === 'audio' && audioPlayer) {
+          setupAudioReceiver(receiver);
+        }
+      }
+    };
+  }
+
+  function setupVideoReceiver(receiver) {
+    dbg(1, '[video] receiver ready, setting up EncodedInsertableStreams');
+    const { readable, writable } = receiver.createEncodedStreams();
+    readable
+      .pipeThrough(new TransformStream({
+        transform(encodedFrame, controller) {
+          try { videoPlayer.decodeFrame(encodedFrame); } catch (e) { console.warn('[video] decode error:', e); }
+          controller.enqueue(encodedFrame);
+        },
+      }))
+      .pipeTo(writable);
+  }
+
+  function setupAudioReceiver(receiver) {
+    dbg(1, '[audio] receiver ready, setting up EncodedInsertableStreams');
+    const { readable, writable } = receiver.createEncodedStreams();
+    readable
+      .pipeThrough(new TransformStream({
+        transform(encodedFrame, controller) {
+          try { audioPlayer.decodeFrame(encodedFrame); } catch (e) { console.warn('[audio] decode error:', e); }
+          // Do NOT enqueue — we play via AudioContext, not the native pipeline.
+          // Enqueue a zero-length frame to keep the WritableStream happy.
+          controller.enqueue(encodedFrame);
+        },
+      }))
+      .pipeTo(writable);
+  }
+
+  // ── Helpers ───────────────────────────────────────────────────────────────
+  function waitForIceGathering(pc) {
+    return new Promise((resolve) => {
+      if (pc.iceGatheringState === 'complete') { resolve(); return; }
+      pc.onicegatheringstatechange = () => {
+        if (pc.iceGatheringState === 'complete') resolve();
+      };
+    });
+  }
+
+  function setStatus(msg) {
+    document.getElementById('status').textContent = msg;
+  }
+</script>
+</html>

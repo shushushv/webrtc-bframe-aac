@@ -1,0 +1,30 @@
+# Build output
+webrtc-bframe-aac
+
+# Media files — use sample/ for committed examples
+*.mp4
+*.mov
+*.mkv
+*.h264
+*.aac
+*.ogg
+
+# Keep the sample files
+!sample/video.h264
+!sample/audio.aac
+
+# macOS
+.DS_Store
+
+# Go
+*.test
+vendor/
+
+# Editor
+.idea/
+.vscode/
+*.swp
+
+# Claude Code
+.claude/
+CLAUDE.md
