@@ -88,6 +88,13 @@ class WebCodecsAudioPlayer {
     source.start(this.nextPlayTime);
     this.nextPlayTime += buffer.duration;
   }
+
+  destroy() {
+    if (this.decoder && this.decoder.state !== 'closed') this.decoder.close();
+    this.audioCtx?.close();
+    this.decoder = null;
+    this.audioCtx = null;
+  }
 }
 
 /**

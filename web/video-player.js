@@ -37,14 +37,14 @@ class WebCodecsVideoPlayer {
    * Creates a <video> element, attaches a MediaStreamTrackGenerator and
    * initialises the VideoDecoder.  Must be called before decodeFrame().
    */
-  init() {
+  init(container = document.body) {
     const video = document.createElement('video');
     video.autoplay = true;
     video.muted = true;
     video.controls = true;
     video.playsInline = true;
     video.style.width = '640px';
-    document.body.appendChild(video);
+    container.appendChild(video);
 
     const stream = new MediaStream();
     video.srcObject = stream;
@@ -87,6 +87,15 @@ class WebCodecsVideoPlayer {
       data: encodedFrame.data,
     });
     this._decoder.decode(chunk);
+  }
+
+  destroy() {
+    for (const frame of this._frameBuffer) frame.close();
+    this._frameBuffer = [];
+    if (this._decoder && this._decoder.state !== 'closed') this._decoder.close();
+    this._writer?.close().catch(() => {});
+    this._decoder = null;
+    this._writer = null;
   }
 
   // ── private ──────────────────────────────────────────────────────────────

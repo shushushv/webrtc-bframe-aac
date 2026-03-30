@@ -14,53 +14,138 @@
     body { font-family: sans-serif; padding: 20px; }
     button { font-size: 16px; padding: 8px 20px; cursor: pointer; }
     #status { margin-top: 12px; color: #555; }
+
+    #mode-selector { margin-bottom: 14px; display: flex; gap: 0; }
+    #mode-selector label {
+      display: flex; align-items: flex-start; gap: 6px;
+      padding: 10px 16px; border: 1px solid #ccc; cursor: pointer;
+      user-select: none; background: #f9f9f9;
+    }
+    #mode-selector label:first-child { border-radius: 6px 0 0 6px; }
+    #mode-selector label:last-child  { border-radius: 0 6px 6px 0; border-left: none; }
+    #mode-selector input[type=radio] { margin-top: 3px; }
+    #mode-selector label:has(input:checked) { background: #e8f0fe; border-color: #4285f4; }
+    #mode-selector.disabled { opacity: 0.5; pointer-events: none; }
+    .mode-title { font-weight: bold; font-size: 15px; }
+    .mode-desc  { font-size: 12px; color: #666; margin-top: 2px; }
+
+    #video-container { margin-top: 16px; }
+    #stopBtn { margin-left: 8px; }
   </style>
 </head>
 <body>
   <h2>WebRTC H.264 B-frame + AAC Player</h2>
-  <button id="startBtn" onclick="startPlayback()">Subscribe</button>
+
+  <div id="mode-selector">
+    <label>
+      <input type="radio" name="renderMode" value="webcodecs" checked>
+      <div>
+        <div class="mode-title">WebCodecs</div>
+        <div class="mode-desc">B-frame reordering + AAC audio</div>
+      </div>
+    </label>
+    <label>
+      <input type="radio" name="renderMode" value="native">
+      <div>
+        <div class="mode-title">Native WebRTC</div>
+        <div class="mode-desc">Raw browser pipeline (B-frame artifacts)</div>
+      </div>
+    </label>
+  </div>
+
+  <div>
+    <button id="startBtn" onclick="startPlayback()">Subscribe</button>
+    <button id="stopBtn" onclick="stopPlayback()" style="display:none">Disconnect</button>
+  </div>
   <div id="status">Click Subscribe to start.</div>
+  <div id="video-container"></div>
 </body>
 <script>
-  // ── Video player (WebCodecs + frame buffer for B-frame reordering) ─────────
-  const videoPlayer = new WebCodecsVideoPlayer({ frameRate: 25, bufferSize: 5 });
-  videoPlayer.init();
-
-  // ── Audio player (WebCodecs AudioDecoder via the "Opus trick") ────────────
-  let audioPlayer = null;
-
   const AUDIO_SAMPLE_RATE = 48000;
+  let currentPc = null;
+  let currentVideoPlayer = null;
+  let currentAudioPlayer = null;
+
+  // ── Controls ──────────────────────────────────────────────────────────────
+  function getRenderMode() {
+    return document.querySelector('input[name="renderMode"]:checked').value;
+  }
+
+  function setControlsEnabled(enabled) {
+    document.getElementById('startBtn').disabled = !enabled;
+    document.getElementById('mode-selector').classList.toggle('disabled', !enabled);
+    document.querySelectorAll('input[name="renderMode"]').forEach(r => r.disabled = !enabled);
+  }
+
+  function setStatus(msg) {
+    document.getElementById('status').textContent = msg;
+  }
 
   // ── Entry point ───────────────────────────────────────────────────────────
   async function startPlayback() {
-    document.getElementById('startBtn').disabled = true;
+    const mode = getRenderMode();
+    setControlsEnabled(false);
     setStatus('Connecting…');
 
-    try {
-      audioPlayer = new WebCodecsAudioPlayer();
-      await audioPlayer.init(AUDIO_SAMPLE_RATE, 2);
-    } catch (e) {
-      console.warn('[audio] init failed:', e);
-      audioPlayer = null;
+    currentVideoPlayer?.destroy();
+    currentAudioPlayer?.destroy();
+    currentVideoPlayer = null;
+    currentAudioPlayer = null;
+
+    const container = document.getElementById('video-container');
+    container.innerHTML = '';
+
+    if (mode === 'webcodecs') {
+      currentVideoPlayer = new WebCodecsVideoPlayer({ frameRate: 25, bufferSize: 5 });
+      currentVideoPlayer.init(container);
+
+      currentAudioPlayer = new WebCodecsAudioPlayer();
+      try {
+        await currentAudioPlayer.init(AUDIO_SAMPLE_RATE, 2);
+      } catch (e) {
+        console.warn('[audio] init failed:', e);
+        currentAudioPlayer = null;
+      }
+    } else {
+      const video = document.createElement('video');
+      video.autoplay = true;
+      video.controls = true;
+      video.playsInline = true;
+      video.style.width = '640px';
+      container.appendChild(video);
     }
 
-    const pc = buildPeerConnection();
+    // encodedInsertableStreams must be set at construction time
+    const pc = new RTCPeerConnection(
+      mode === 'webcodecs' ? { encodedInsertableStreams: true } : {}
+    );
+    currentPc = pc;
+
+    pc.onconnectionstatechange = () => {
+      dbg(1, '[pc] connectionState:', pc.connectionState);
+      if (['failed', 'disconnected', 'closed'].includes(pc.connectionState)) {
+        stopPlayback();
+      }
+    };
 
     pc.addTransceiver('video', { direction: 'recvonly' });
-    if (audioPlayer) {
+    if (currentAudioPlayer) {
       pc.addTransceiver('audio', { direction: 'recvonly' });
     }
 
-    setupReceivers(pc);
+    if (mode === 'webcodecs') {
+      setupWebCodecsReceivers(pc, currentVideoPlayer, currentAudioPlayer);
+    } else {
+      setupNativeReceiver(pc);
+    }
 
     const offer = await pc.createOffer();
     await pc.setLocalDescription(offer);
     await waitForIceGathering(pc);
     dbg(1, '[signalling] offer created, ICE gathering complete', { offer: pc.localDescription.sdp });
 
-    // "Opus trick": rewrite the outgoing SDP so the server negotiates MP4A-LATM.
     let outgoingSDP = pc.localDescription.sdp;
-    if (audioPlayer) {
+    if (currentAudioPlayer) {
       outgoingSDP = rewriteSDPAudioToAAC(outgoingSDP, AUDIO_SAMPLE_RATE);
       dbg(1, '[audio] SDP rewritten for MP4A-LATM at', AUDIO_SAMPLE_RATE);
     }
@@ -73,70 +158,82 @@
 
     if (!resp.ok) {
       setStatus('Server error: ' + resp.status);
+      stopPlayback();
       return;
     }
 
     const answerSDP = await resp.text();
     dbg(1, '[signalling] answer received', { answerSDP });
     await pc.setRemoteDescription({ type: 'answer', sdp: answerSDP });
-    setStatus(`Connected — audio ${audioPlayer ? AUDIO_SAMPLE_RATE + ' Hz' : 'off'}`);
+
+    document.getElementById('stopBtn').style.display = '';
+    if (mode === 'webcodecs') {
+      setStatus(`Connected — WebCodecs mode — audio ${currentAudioPlayer ? AUDIO_SAMPLE_RATE + ' Hz' : 'off'}`);
+    } else {
+      setStatus('Connected — Native WebRTC mode — audio off (B-frame artifacts expected)');
+    }
   }
 
-  // ── RTCPeerConnection factory ─────────────────────────────────────────────
-  function buildPeerConnection() {
-    const pc = new RTCPeerConnection({ encodedInsertableStreams: true });
-
-    pc.onconnectionstatechange = () => {
-      dbg(1, '[pc] connectionState:', pc.connectionState);
-    };
-
-    return pc;
+  function stopPlayback() {
+    const pc = currentPc;
+    currentPc = null;
+    pc?.close();
+    currentVideoPlayer?.destroy();
+    currentAudioPlayer?.destroy();
+    currentVideoPlayer = null;
+    currentAudioPlayer = null;
+    handleDisconnect();
   }
 
-  // ── EncodedInsertableStreams setup ────────────────────────────────────────
-  function setupReceivers(pc) {
+  function handleDisconnect() {
+    document.getElementById('stopBtn').style.display = 'none';
+    document.getElementById('startBtn').textContent = 'Reconnect';
+    setControlsEnabled(true);
+    setStatus('Disconnected — change mode or click Reconnect.');
+  }
+
+  // ── WebCodecs mode: EncodedInsertableStreams ───────────────────────────────
+  function setupWebCodecsReceivers(pc, videoPlayer, audioPlayer) {
+    let streamsSetUp = false;
     pc.oniceconnectionstatechange = () => {
       dbg(1, '[ice]', pc.iceConnectionState);
-      setStatus('ICE: ' + pc.iceConnectionState);
-
-      if (pc.iceConnectionState !== 'connected') return;
+      if (pc.iceConnectionState !== 'connected' || streamsSetUp) return;
+      streamsSetUp = true;
 
       for (const receiver of pc.getReceivers()) {
         if (receiver.track.kind === 'video') {
-          setupVideoReceiver(receiver);
+          setupEncodedReceiver(receiver, videoPlayer, 'video');
         } else if (receiver.track.kind === 'audio' && audioPlayer) {
-          setupAudioReceiver(receiver);
+          setupEncodedReceiver(receiver, audioPlayer, 'audio');
         }
       }
     };
   }
 
-  function setupVideoReceiver(receiver) {
-    dbg(1, '[video] receiver ready, setting up EncodedInsertableStreams');
+  function setupEncodedReceiver(receiver, player, label) {
+    dbg(1, `[${label}] receiver ready, setting up EncodedInsertableStreams`);
     const { readable, writable } = receiver.createEncodedStreams();
     readable
       .pipeThrough(new TransformStream({
         transform(encodedFrame, controller) {
-          try { videoPlayer.decodeFrame(encodedFrame); } catch (e) { console.warn('[video] decode error:', e); }
+          try { player.decodeFrame(encodedFrame); } catch (e) { console.warn(`[${label}] decode error:`, e); }
           controller.enqueue(encodedFrame);
         },
       }))
       .pipeTo(writable);
   }
 
-  function setupAudioReceiver(receiver) {
-    dbg(1, '[audio] receiver ready, setting up EncodedInsertableStreams');
-    const { readable, writable } = receiver.createEncodedStreams();
-    readable
-      .pipeThrough(new TransformStream({
-        transform(encodedFrame, controller) {
-          try { audioPlayer.decodeFrame(encodedFrame); } catch (e) { console.warn('[audio] decode error:', e); }
-          // Do NOT enqueue — we play via AudioContext, not the native pipeline.
-          // Enqueue a zero-length frame to keep the WritableStream happy.
-          controller.enqueue(encodedFrame);
-        },
-      }))
-      .pipeTo(writable);
+  // ── Native WebRTC mode ────────────────────────────────────────────────────
+  function setupNativeReceiver(pc) {
+    pc.ontrack = (event) => {
+      if (event.track.kind === 'video') {
+        dbg(1, '[native] video track received');
+        const video = document.querySelector('#video-container video');
+        if (video) {
+          video.srcObject = event.streams[0] ?? new MediaStream([event.track]);
+        }
+      }
+    };
   }
 
   // ── Helpers ───────────────────────────────────────────────────────────────
@@ -147,10 +244,6 @@
         if (pc.iceGatheringState === 'complete') resolve();
       };
     });
-  }
-
-  function setStatus(msg) {
-    document.getElementById('status').textContent = msg;
   }
 </script>
 </html>

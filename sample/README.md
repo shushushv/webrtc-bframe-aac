@@ -10,15 +10,21 @@ To use your own source, generate the files with the commands below (adjust `-t` 
 
 ## Generate H.264 with B-frames
 
+`-b_strategy 0` and `-x264-params "bframes=2:b-adapt=0"` disable libx264's adaptive
+B-frame decision so B-frames are actually emitted; without them the encoder often
+produces few or no B-frames depending on content.
+
 ```bash
 ffmpeg -i input.mp4 \
-  -t 5 \        # 5-second clip
+  -t 5 \
   -an \
   -c:v libx264 \
-  -bf 2 \       # max 2 consecutive B-frames
-  -g 60 \       # keyframe interval
-  -r 25 \       # output frame rate
-  -preset fast \
+  -bf 2 \
+  -b_strategy 0 \
+  -x264-params "bframes=2:b-adapt=0:ref=3" \
+  -g 50 \
+  -r 25 \
+  -preset medium \
   -crf 23 \
   sample/video.h264
 ```
@@ -27,7 +33,7 @@ ffmpeg -i input.mp4 \
 
 ```bash
 ffmpeg -i input.mp4 \
-  -t 5 \        # 5-second clip
+  -t 5 \
   -vn \
   -c:a aac \
   -b:a 128k \
@@ -46,10 +52,10 @@ ffprobe -v error -show_frames -select_streams v sample/video.h264 \
 Expected output (B-frames confirmed):
 
 ```
- 335 pict_type=B
-   5 pict_type=I
- 380 pict_type=P
+  80 pict_type=B
+   3 pict_type=I
+  42 pict_type=P
 ```
 
-If `pict_type=B` is missing, the video has no B-frames — increase `-bf` or check
-that your encoder supports B-frame encoding.
+If `pict_type=B` is missing, the video has no B-frames — check that your
+encoder supports B-frame encoding and that `-b_strategy 0` is passed.
