@@ -1,6 +1,6 @@
 # Playing H.264 B-frames and AAC Audio over WebRTC — Without Patching the Browser
 
-> **TL;DR:** Standard WebRTC stacks set RTP timestamps from DTS, which breaks B-frame video.  We fix this server-side by computing PTS and stamping every RTP packet ourselves, then intercept encoded frames client-side with `EncodedInsertableStreams` and reorder them through a tiny sort buffer before `VideoDecoder`.  AAC gets smuggled in by rewriting the SDP Offer — replacing Opus with `MP4A-LATM` — so the browser never refuses the transceiver.  Complete demo (Go server + plain JS client): [github.com/shushushv/webrtc-bframe-aac](https://github.com/shushushv/webrtc-bframe-aac).
+> **TL;DR:** Standard WebRTC stacks set RTP timestamps from DTS, which breaks B-frame video.  We fix this server-side by computing PTS and stamping every RTP packet ourselves, then use `MediaStreamTrackProcessor` to pull already-decoded `VideoFrame` objects from the native pipeline, read the server-stamped PTS via `frame.metadata().rtpTimestamp`, and reorder them through a 5-frame sort buffer before writing to `MediaStreamTrackGenerator`.  AAC gets smuggled in by rewriting the SDP Offer — replacing Opus with `MP4A-LATM` — so the browser never refuses the transceiver.  Complete demo (Go server + plain JS client): [github.com/shushushv/webrtc-bframe-aac](https://github.com/shushushv/webrtc-bframe-aac).
 
 ---
 
@@ -84,11 +84,12 @@ One extra detail: when the file loops, add the total duration of the previous pa
 
 Even with correct PTS in the RTP timestamp, the browser's built-in H.264 decoder renders in arrival order.  The `<video>` element has no concept of "hold this frame until its B-frames arrive."  We bypass the native pipeline entirely.
 
-### EncodedInsertableStreams intercepts before the native decoder
+### ~~Approach 1: EncodedInsertableStreams + WebCodecs VideoDecoder~~
 
-`EncodedInsertableStreams` lets us tap the encoded frame stream between the RTP layer and the browser decoder.  We redirect everything to our own `VideoDecoder` via a `TransformStream`, then sort frames by the `rtpTimestamp` exposed in `RTCEncodedVideoFrame.getMetadata()`.
+~~`EncodedInsertableStreams` lets us tap the encoded frame stream between the RTP layer and the browser decoder.  We redirect everything to our own `VideoDecoder` via a `TransformStream`, then sort frames by the `rtpTimestamp` exposed in `RTCEncodedVideoFrame.getMetadata()`.~~
 
 ```js
+// Approach 1 (superseded)
 _onFrame(frame) {
     this._frameBuffer.push(frame);
     this._frameBuffer.sort((a, b) => a.timestamp - b.timestamp);
@@ -100,7 +101,39 @@ _onFrame(frame) {
 }
 ```
 
-The buffer depth must be at least `maxBframes + 1`.  Five frames adds ~200 ms of latency at 25 fps — acceptable for most streaming use cases.  Decoded `VideoFrame` objects are written to a `MediaStreamTrackGenerator` attached to a `<video>` element.  Full intercept + decode wiring: [`web/video-player.js`](https://github.com/shushushv/webrtc-bframe-aac/blob/main/web/video-player.js).
+~~This approach requires manually configuring `VideoDecoder` (codec string, SPS/PPS initialization) and setting `{ encodedInsertableStreams: true }` on the `RTCPeerConnection` for all tracks.  It also has a known ordering hazard under packet loss (see [Limitations](#limitations-and-next-steps), item 1).~~
+
+### Approach 2: MediaStreamTrackProcessor (current)
+
+Credit to [Philip Eliasson's comment on WebRTC CL 419460](https://webrtc-review.googlesource.com/c/src/+/419460/comment/6a0a1921_eafdb295/) for the idea.  Instead of intercepting *encoded* frames before the decoder, we let the browser's native H.264 decoder run normally, then pull *decoded* `VideoFrame` objects via `MediaStreamTrackProcessor`.  The PTS the server wrote is still available via `frame.metadata().rtpTimestamp`.
+
+```js
+_onFrame(frame) {
+    const rtpTs = frame.metadata()?.rtpTimestamp;
+    const sortKey = rtpTs ?? frame.timestamp;
+
+    this._frameBuffer.push({ frame, sortKey });
+    this._frameBuffer.sort((a, b) => a.sortKey - b.sortKey);
+
+    if (this._frameBuffer.length >= this.bufferSize) {  // default: 5
+        const oldest = this._frameBuffer.shift();
+        this._writer.write(oldest.frame).then(() => oldest.frame.close());
+    }
+}
+```
+
+Full implementation: [`web/video-player.js`](https://github.com/shushushv/webrtc-bframe-aac/blob/main/web/video-player.js).
+
+### Comparison
+
+| | ~~Approach 1 (WebCodecs)~~ | Approach 2 (TrackProcessor) |
+|---|---|---|
+| Intercept point | Before decoder (encoded frames) | After decoder (decoded frames) |
+| `encodedInsertableStreams: true` required | For all tracks | Audio only (AAC decoding) |
+| Manual `VideoDecoder` | Yes (codec string, SPS/PPS) | No (native decoder) |
+| PTS source | `encodedFrame.getMetadata().rtpTimestamp` | `videoFrame.metadata().rtpTimestamp` |
+| Frame-order guarantee under loss | No (known `EncodedInsertableStreams` bug) | Yes (native jitter buffer) |
+| Browser support | Chrome 94+, Safari 17.4+ | Chrome 110+ (`rtpTimestamp` field) |
 
 ---
 
@@ -178,19 +211,20 @@ ffmpeg -i input.mp4 -vn -c:a aac -b:a 128k sample/audio.aac
 
 | Feature | Chrome | Firefox | Safari |
 |---------|--------|---------|--------|
-| `EncodedInsertableStreams` | 86+ | 117+ | 15.4+ |
-| `VideoDecoder` | 94+ | 130+ | 16.1+ |
+| `EncodedInsertableStreams` (audio) | 86+ | 117+ | 15.4+ |
+| `MediaStreamTrackProcessor` | 94+ | 135+ | — |
+| `VideoFrame.metadata().rtpTimestamp` | 110+ | — | — |
 | `MediaStreamTrackGenerator` | 94+ | — | 17.4+ |
 | `AudioDecoder` (AAC) | 94+ | 130+ | 16.1+ |
-| **Full demo** | **94+** | **—** | **17.4+** |
+| **Full demo (Approach 2)** | **110+** | **—** | **—** |
 
-Firefox lacks `MediaStreamTrackGenerator`, so the video path is Chrome/Safari only.
+The current approach depends on `VideoFrame.metadata().rtpTimestamp`, which is only available in Chrome 110+.  Firefox and Safari do not yet support the full video path.
 
 ---
 
 ## Limitations and Next Steps
 
-- **Not yet production-ready**: `EncodedInsertableStreams` does not guarantee frame delivery order out of the transform.  Under packet loss or reordering, frames can arrive at the sort buffer out of sequence, causing corruption or decode failures.  This is a known WebRTC issue ([issues.webrtc.org/454162516](https://issues.webrtc.org/issues/454162516)) with a patch under review ([CL 419460](https://webrtc-review.googlesource.com/c/src/+/419460)).
+- ~~**Not yet production-ready (Approach 1)**: `EncodedInsertableStreams` does not guarantee frame delivery order out of the transform.  Under packet loss or reordering, frames can arrive at the sort buffer out of sequence, causing corruption or decode failures.  This is a known WebRTC issue ([issues.webrtc.org/454162516](https://issues.webrtc.org/issues/454162516)) with a patch under review ([CL 419460](https://webrtc-review.googlesource.com/c/src/+/419460)) — and the comment on that CL is what inspired Approach 2.  Approach 2 sidesteps this entirely: frames are pulled after the native jitter buffer, so ordering is guaranteed by the browser.~~
 - **No lip-sync**: Video and audio pipelines start independently.  A production build must synchronize them using RTP timestamps.
 - **Latency**: The 5-frame sort buffer adds ~200 ms at 25 fps.  Reduce it for streams with fewer B-frames.
 - **RTCP**: The server drains RTCP but ignores PLI/FIR keyframe requests.
@@ -200,6 +234,6 @@ Firefox lacks `MediaStreamTrackGenerator`, so the video path is Chrome/Safari on
 
 ## Conclusion
 
-Playing H.264 B-frames over WebRTC requires taking ownership of two things: the RTP timestamp (PTS, not DTS) and the decode pipeline (WebCodecs, not the browser's built-in decoder).  Adding AAC on top needs one more workaround — the SDP rewrite — but the result is a fully functional pipeline with no browser patches or custom builds.
+Playing H.264 B-frames over WebRTC requires taking ownership of the RTP timestamp (PTS, not DTS), then reordering decoded frames on the client using `MediaStreamTrackProcessor` and `frame.metadata().rtpTimestamp`.  This reuses the browser's native H.264 decoder and avoids the frame-ordering hazard of `EncodedInsertableStreams`.  Adding AAC on top needs one more workaround — the SDP rewrite — but the result is a fully functional pipeline with no browser patches or custom builds.
 
 Source: [github.com/shushushv/webrtc-bframe-aac](https://github.com/shushushv/webrtc-bframe-aac)
