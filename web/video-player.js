@@ -3,39 +3,32 @@ const V = parseInt(new URLSearchParams(location.search).get('v') ?? '0', 10);
 const dbg = (level, ...args) => { if (V >= level) console.log(...args); };
 
 /**
- * WebCodecsVideoPlayer — decodes H.264 with B-frames via WebCodecs + MediaStreamTrackGenerator.
+ * VideoPlayer — B-frame reordering using the browser's native H.264 decoder
+ * via MediaStreamTrackProcessor / MediaStreamTrackGenerator.
  *
- * The server sets the RTP timestamp to PTS (not DTS), so we read
- * encodedFrame.getMetadata().rtpTimestamp as the display timestamp.
- * A small frame buffer (default 5 frames) is sorted by PTS before rendering,
- * which corrects the decode-order vs display-order discrepancy introduced by B-frames.
+ * Decoded VideoFrames are pulled from the native WebRTC pipeline and reordered
+ * by the RTP timestamp (= PTS set by the server) exposed via frame.metadata().
  *
  * Browser requirements:
- *   - EncodedInsertableStreams (Chrome 86+, Firefox 117+, Safari 15.4+)
- *   - WebCodecs VideoDecoder     (Chrome 94+, Safari 16+)
- *   - MediaStreamTrackGenerator  (Chrome 94+, Safari 17.4+)
+ *   - MediaStreamTrackProcessor  (Chrome 94+)
+ *   - MediaStreamTrackGenerator  (Chrome 94+)
+ *   - VideoFrame.metadata()      (Chrome 106+, metadata.rtpTimestamp: Chrome 110+)
  */
-class WebCodecsVideoPlayer {
+class VideoPlayer {
   /**
    * @param {object} [options]
-   * @param {number} [options.frameRate=25]
-   * @param {number} [options.bufferSize=5]   Number of frames to buffer before rendering.
-   * @param {string} [options.codec='avc1.42002a']  WebCodecs codec string.
+   * @param {number} [options.bufferSize=5]  Frames to buffer before rendering.
    */
   constructor(options = {}) {
-    this.frameRate = options.frameRate || 25;
     this.bufferSize = options.bufferSize || 5;
-    this.codec = options.codec || 'avc1.42002a';
-    this.frameDurationUs = (1 / this.frameRate) * 1e6; // microseconds
-
-    this._decoder = null;
     this._writer = null;
     this._frameBuffer = [];
+    this._destroyed = false;
   }
 
   /**
-   * Creates a <video> element, attaches a MediaStreamTrackGenerator and
-   * initialises the VideoDecoder.  Must be called before decodeFrame().
+   * Creates a <video> element backed by a MediaStreamTrackGenerator.
+   * Must be called before attachTrack().
    */
   init(container = document.body) {
     const video = document.createElement('video');
@@ -46,75 +39,72 @@ class WebCodecsVideoPlayer {
     video.style.width = '640px';
     container.appendChild(video);
 
-    const stream = new MediaStream();
-    video.srcObject = stream;
-
     const generator = new MediaStreamTrackGenerator({ kind: 'video' });
-    stream.addTrack(generator);
+    video.srcObject = new MediaStream([generator]);
     this._writer = generator.writable.getWriter();
 
-    this._decoder = new VideoDecoder({
-      output: (frame) => this._onFrame(frame),
-      error: (e) => console.error('VideoDecoder error:', e),
-    });
-    this._decoder.configure({
-      codec: this.codec,
-      hardwareAcceleration: 'prefer-hardware',
-    });
-    dbg(1, `[video] VideoDecoder configured — codec=${this.codec} bufferSize=${this.bufferSize}`);
-
     video.play();
+    dbg(1, `[video] initialized — bufferSize=${this.bufferSize}`);
   }
 
   /**
-   * Decodes one encoded WebRTC frame.
-   * Call this from an EncodedInsertableStreams TransformStream.
+   * Attaches a live video MediaStreamTrack from the RTCPeerConnection.
+   * Starts pulling decoded VideoFrames and feeding them through the reorder buffer.
    *
-   * @param {RTCEncodedVideoFrame} encodedFrame
+   * @param {MediaStreamTrack} track  kind === 'video'
    */
-  decodeFrame(encodedFrame) {
-    // rtpTimestamp is the raw RTP timestamp set by the server (= PTS in 90 kHz units).
-    const rtpTs = encodedFrame.getMetadata().rtpTimestamp;
-    // WebCodecs expects microseconds.
-    const timestampUs = (rtpTs / 90000) * 1e6;
-
-    dbg(2, `[recv] type=${encodedFrame.type} rtpTs=${rtpTs} pts_ms=${(timestampUs / 1000).toFixed(1)} byteLength=${encodedFrame.data.byteLength}`);
-
-    const chunk = new EncodedVideoChunk({
-      type: encodedFrame.type === 'key' ? 'key' : 'delta',
-      timestamp: timestampUs,
-      duration: this.frameDurationUs,
-      data: encodedFrame.data,
-    });
-    this._decoder.decode(chunk);
+  attachTrack(track) {
+    dbg(1, '[video] attaching track, starting read loop');
+    const processor = new MediaStreamTrackProcessor({ track });
+    this._readLoop(processor.readable.getReader());
   }
 
   destroy() {
-    for (const frame of this._frameBuffer) frame.close();
+    this._destroyed = true;
+    for (const { frame } of this._frameBuffer) frame.close();
     this._frameBuffer = [];
-    if (this._decoder && this._decoder.state !== 'closed') this._decoder.close();
     this._writer?.close().catch(() => {});
-    this._decoder = null;
     this._writer = null;
   }
 
   // ── private ──────────────────────────────────────────────────────────────
 
-  _onFrame(frame) {
-    this._frameBuffer.push(frame);
+  async _readLoop(reader) {
+    while (!this._destroyed) {
+      let result;
+      try {
+        result = await reader.read();
+      } catch (e) {
+        if (!this._destroyed) console.warn('[video] reader error:', e);
+        break;
+      }
+      const { value: frame, done } = result;
+      if (done) break;
+      this._onFrame(frame);
+    }
+    // Flush any buffered frames on loop exit.
+    for (const { frame } of this._frameBuffer) frame.close();
+    this._frameBuffer = [];
+  }
 
-    // Sort by PTS so B-frames are emitted before the P-frame they precede.
-    this._frameBuffer.sort((a, b) => a.timestamp - b.timestamp);
+  _onFrame(frame) {
+    const meta = frame.metadata();
+    // rtpTimestamp is the raw RTP timestamp set by the server (= PTS, 90 kHz).
+    // If the browser doesn't expose it yet, fall back to frame.timestamp (µs).
+    const rtpTs = meta?.rtpTimestamp;
+    const sortKey = rtpTs ?? frame.timestamp;
+
+    dbg(2, `[video] rtpTs=${rtpTs} frameTs_ms=${(frame.timestamp / 1000).toFixed(1)} sortKey=${sortKey}`);
+
+    this._frameBuffer.push({ frame, sortKey });
+    this._frameBuffer.sort((a, b) => a.sortKey - b.sortKey);
 
     if (this._frameBuffer.length >= this.bufferSize) {
       const oldest = this._frameBuffer.shift();
-      dbg(2, `[render] type=${oldest.type} pts_ms=${(oldest.timestamp / 1000).toFixed(1)}`);
-      this._writer.write(oldest)
-        .then(() => oldest.close())
-        .catch((err) => {
-          console.warn('frame write error:', err);
-          oldest.close();
-        });
+      dbg(2, `[video][render] sortKey=${oldest.sortKey}`);
+      this._writer.write(oldest.frame)
+        .then(() => oldest.frame.close())
+        .catch(err => { console.warn('[video] write error:', err); oldest.frame.close(); });
     }
   }
 }

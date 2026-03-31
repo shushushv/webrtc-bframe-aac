@@ -38,9 +38,9 @@
 
   <div id="mode-selector">
     <label>
-      <input type="radio" name="renderMode" value="webcodecs" checked>
+      <input type="radio" name="renderMode" value="main" checked>
       <div>
-        <div class="mode-title">WebCodecs</div>
+        <div class="mode-title">TrackProcessor</div>
         <div class="mode-desc">B-frame reordering + AAC audio</div>
       </div>
     </label>
@@ -95,8 +95,8 @@
     const container = document.getElementById('video-container');
     container.innerHTML = '';
 
-    if (mode === 'webcodecs') {
-      currentVideoPlayer = new WebCodecsVideoPlayer({ frameRate: 25, bufferSize: 5 });
+    if (mode === 'main') {
+      currentVideoPlayer = new VideoPlayer({ bufferSize: 5 });
       currentVideoPlayer.init(container);
 
       currentAudioPlayer = new WebCodecsAudioPlayer();
@@ -115,9 +115,9 @@
       container.appendChild(video);
     }
 
-    // encodedInsertableStreams must be set at construction time
+    // encodedInsertableStreams is required for audio (WebCodecsAudioPlayer intercepts encoded frames).
     const pc = new RTCPeerConnection(
-      mode === 'webcodecs' ? { encodedInsertableStreams: true } : {}
+      currentAudioPlayer ? { encodedInsertableStreams: true } : {}
     );
     currentPc = pc;
 
@@ -128,13 +128,13 @@
       }
     };
 
-    pc.addTransceiver('video', { direction: 'recvonly' });
-    if (currentAudioPlayer) {
-      pc.addTransceiver('audio', { direction: 'recvonly' });
-    }
+    const videoTransceiver = pc.addTransceiver('video', { direction: 'recvonly' });
+    const audioTransceiver = currentAudioPlayer
+      ? pc.addTransceiver('audio', { direction: 'recvonly' })
+      : null;
 
-    if (mode === 'webcodecs') {
-      setupWebCodecsReceivers(pc, currentVideoPlayer, currentAudioPlayer);
+    if (mode === 'main') {
+      setupMainReceivers(pc, videoTransceiver, audioTransceiver, currentVideoPlayer, currentAudioPlayer);
     } else {
       setupNativeReceiver(pc);
     }
@@ -152,23 +152,21 @@
 
     const resp = await fetch('/whep', {
       method: 'POST',
-      body: outgoingSDP,
       headers: { 'Content-Type': 'application/sdp' },
+      body: outgoingSDP,
     });
-
     if (!resp.ok) {
       setStatus('Server error: ' + resp.status);
       stopPlayback();
       return;
     }
-
     const answerSDP = await resp.text();
     dbg(1, '[signalling] answer received', { answerSDP });
     await pc.setRemoteDescription({ type: 'answer', sdp: answerSDP });
 
     document.getElementById('stopBtn').style.display = '';
-    if (mode === 'webcodecs') {
-      setStatus(`Connected — WebCodecs mode — audio ${currentAudioPlayer ? AUDIO_SAMPLE_RATE + ' Hz' : 'off'}`);
+    if (mode === 'main') {
+      setStatus(`Connected — TrackProcessor mode — audio ${currentAudioPlayer ? AUDIO_SAMPLE_RATE + ' Hz' : 'off'}`);
     } else {
       setStatus('Connected — Native WebRTC mode — audio off (B-frame artifacts expected)');
     }
@@ -192,35 +190,32 @@
     setStatus('Disconnected — change mode or click Reconnect.');
   }
 
-  // ── WebCodecs mode: EncodedInsertableStreams ───────────────────────────────
-  function setupWebCodecsReceivers(pc, videoPlayer, audioPlayer) {
-    let streamsSetUp = false;
-    pc.oniceconnectionstatechange = () => {
-      dbg(1, '[ice]', pc.iceConnectionState);
-      if (pc.iceConnectionState !== 'connected' || streamsSetUp) return;
-      streamsSetUp = true;
+  // ── Main mode: TrackProcessor video + EncodedInsertableStreams audio ─────────
+  function setupMainReceivers(pc, videoTransceiver, audioTransceiver, videoPlayer, audioPlayer) {
+    // Video: encoded stream must be consumed synchronously when encodedInsertableStreams is set,
+    // otherwise frames back-pressure and the decoder never receives them.
+    // We pass through an empty TransformStream — decoded frames are pulled via TrackProcessor below.
+    const { readable: vr, writable: vw } = videoTransceiver.receiver.createEncodedStreams();
+    vr.pipeThrough(new TransformStream()).pipeTo(vw);
 
-      for (const receiver of pc.getReceivers()) {
-        if (receiver.track.kind === 'video') {
-          setupEncodedReceiver(receiver, videoPlayer, 'video');
-        } else if (receiver.track.kind === 'audio' && audioPlayer) {
-          setupEncodedReceiver(receiver, audioPlayer, 'audio');
-        }
-      }
-    };
-  }
-
-  function setupEncodedReceiver(receiver, player, label) {
-    dbg(1, `[${label}] receiver ready, setting up EncodedInsertableStreams`);
-    const { readable, writable } = receiver.createEncodedStreams();
-    readable
-      .pipeThrough(new TransformStream({
+    // Audio: encoded frames are intercepted and decoded by WebCodecsAudioPlayer.
+    if (audioTransceiver && audioPlayer) {
+      const { readable: ar, writable: aw } = audioTransceiver.receiver.createEncodedStreams();
+      ar.pipeThrough(new TransformStream({
         transform(encodedFrame, controller) {
-          try { player.decodeFrame(encodedFrame); } catch (e) { console.warn(`[${label}] decode error:`, e); }
+          try { audioPlayer.decodeFrame(encodedFrame); } catch (e) { console.warn('[audio] decode error:', e); }
           controller.enqueue(encodedFrame);
         },
-      }))
-      .pipeTo(writable);
+      })).pipeTo(aw);
+    }
+
+    // Video decoded frames are pulled from the native decoder via MediaStreamTrackProcessor.
+    pc.ontrack = (event) => {
+      if (event.track.kind === 'video') {
+        dbg(1, '[video] track received, attaching TrackProcessor');
+        videoPlayer.attachTrack(event.track);
+      }
+    };
   }
 
   // ── Native WebRTC mode ────────────────────────────────────────────────────
